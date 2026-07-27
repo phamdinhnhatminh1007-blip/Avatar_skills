@@ -1,4 +1,4 @@
-# Leng Keng — Hand Magic ✋🔥⚡🌪️🧊🪨
+# Avatar_skills — Hand Magic ✋🔥⚡🌪️🧊🪨
 
 Điều khiển **phép thuật tứ đại nguyên tố** (lấy cảm hứng từ *Avatar*) bằng
 **cử chỉ tay** trước webcam, theo thời gian thực. Giơ đúng thế tay là tung
