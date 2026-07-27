@@ -89,7 +89,7 @@ SKILLS = {
     1: earth.cast,         # Nắm đấm       -> khiên đá (Thổ)
     3: lightning.cast,     # Ngón trỏ      -> sét (Sét)
     4: air.cast,           # Ngón cái      -> lốc xoáy (Khí)
-    5: ice.cast,           # Spider-Man -> tường băng (Thủy)
+    5: ice.cast,           # Spider-Man -> tường băng (Băng)
     # 2: Ngón giữa         -> chưa gán
 }
 ```
