@@ -19,17 +19,31 @@ import math
 import os
 import random
 import time
+from copy import copy
 
 import numpy as np
 from PIL import Image
 from panda3d.core import ColorBlendAttrib
 from ursina import (
     Entity, camera, color, destroy, time as utime, Vec3, Vec2, Shader, Texture,
-    Audio,
+    Audio, Mesh,
 )
 
 # --- Am thanh: dat file .wav/.ogg vao thu muc sounds/ ---
 _SFX_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds")
+
+# Giu particle Python song den het animation. Neu khong co strong reference,
+# Ursina/Panda3D co the thu gom particle giua luong phun.
+_ACTIVE_FIRE = {}
+
+
+def _retain_fire(entity):
+    _ACTIVE_FIRE[id(entity)] = entity
+
+
+def _finish_fire(entity):
+    _ACTIVE_FIRE.pop(id(entity), None)
+    destroy(entity)
 
 
 def play_sound(name, volume=0.7):
@@ -178,6 +192,150 @@ default_input=dict(
 ))
 
 
+# Shader rieng cho luong phun: cat alpha thanh luoi lua, day noise chay tu
+# goc toi mui va doi mau theo nhiet do. Khac fire_shader cua qua cau, shader
+# nay duoc toi uu cho billboard dai cua sung phun lua.
+flame_jet_shader = Shader(name='flame_jet_shader', language=Shader.GLSL,
+vertex='''
+#version 130
+uniform mat4 p3d_ModelViewProjectionMatrix;
+in vec4 p3d_Vertex;
+in vec2 p3d_MultiTexCoord0;
+out vec2 uv;
+
+void main() {
+    gl_Position = p3d_ModelViewProjectionMatrix * p3d_Vertex;
+    uv = p3d_MultiTexCoord0;
+}
+''',
+fragment='''
+#version 140
+uniform vec4 p3d_ColorScale;
+in vec2 uv;
+out vec4 fragColor;
+
+uniform float time;
+uniform float phase;
+uniform float heat;
+uniform float turbulence;
+
+float hash(vec2 p) {
+    p = fract(p * vec2(123.34, 456.21));
+    p += dot(p, p + 45.32);
+    return fract(p.x * p.y);
+}
+
+float noise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(
+        mix(hash(i), hash(i + vec2(1.0, 0.0)), f.x),
+        mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), f.x),
+        f.y
+    );
+}
+
+float fbm(vec2 p) {
+    float value = 0.0;
+    float amplitude = 0.55;
+    for (int i = 0; i < 5; i++) {
+        value += noise(p) * amplitude;
+        p = p * 2.03 + vec2(7.1, 3.7);
+        amplitude *= 0.48;
+    }
+    return value;
+}
+
+vec3 fire_color(float temperature) {
+    vec3 deep_red = vec3(0.72, 0.015, 0.0);
+    vec3 orange = vec3(1.0, 0.20, 0.005);
+    vec3 gold = vec3(1.0, 0.66, 0.045);
+    vec3 hot = vec3(1.0, 0.96, 0.60);
+    vec3 white_hot = vec3(1.0, 1.0, 0.96);
+    if (temperature < 0.22)
+        return mix(deep_red, orange, temperature / 0.22);
+    if (temperature < 0.48)
+        return mix(orange, gold, (temperature - 0.22) / 0.26);
+    if (temperature < 0.76)
+        return mix(gold, hot, (temperature - 0.48) / 0.28);
+    return mix(hot, white_hot, (temperature - 0.76) / 0.24);
+}
+
+void main() {
+    float y = clamp(uv.y, 0.0, 1.0);
+    float x = uv.x * 2.0 - 1.0;
+    float travel = time * 2.7 + phase;
+
+    float coarse = fbm(vec2(x * 1.7 + phase, y * 4.0 - travel));
+    float detail = fbm(vec2(x * 4.8 - phase, y * 9.0 - travel * 1.75));
+    float flow = coarse * 0.68 + detail * 0.32;
+
+    // Bien dang ngang tang dan ve mui, giong dong khi nong xe luoi lua.
+    float warp = (flow - 0.5) * turbulence * (0.16 + y * 0.48);
+    warp += sin(y * 16.0 - travel * 2.1 + phase) * turbulence * y * 0.075;
+    float cone_width = mix(0.62, 0.055, pow(y, 0.82));
+    cone_width *= 0.83 + flow * 0.40;
+
+    float edge_distance = 1.0 - abs(x + warp) / max(cone_width, 0.01);
+    float body = smoothstep(0.035, 0.27, edge_distance);
+    float sharp_core = smoothstep(0.20, 0.78, edge_distance);
+    float base_fade = smoothstep(0.0, 0.075, y);
+    float torn_tip = 1.0 - smoothstep(0.76 + (flow - 0.5) * 0.24, 1.0, y);
+    float alpha = body * base_fade * torn_tip;
+    float combustion = smoothstep(0.30, 0.67, flow + edge_distance * 0.24);
+    alpha *= (0.52 + combustion * 0.48) * (0.68 + flow * 0.28);
+
+    float temperature = (
+        heat * 0.50
+        + sharp_core * 0.24
+        + flow * 0.21
+        - y * 0.30
+    );
+    vec3 col = fire_color(clamp(temperature, 0.0, 1.0));
+    col *= 0.86 + sharp_core * 0.30 + heat * 0.18;
+    col *= p3d_ColorScale.rgb;
+
+    fragColor = vec4(col, alpha * p3d_ColorScale.a);
+}
+''',
+default_input=dict(
+    time=0.0,
+    phase=0.0,
+    heat=0.65,
+    turbulence=0.7,
+))
+
+
+def _make_flame_cone(rings=16, sides=28):
+    """Mat non 3D mo rong theo -Z, UV lien tuc de noise chay doc luong."""
+    vertices = []
+    uvs = []
+    for ring in range(rings - 1):
+        t0 = ring / (rings - 1)
+        t1 = (ring + 1) / (rings - 1)
+        r0 = 0.075 + 0.49 * (t0 ** 0.78)
+        r1 = 0.075 + 0.49 * (t1 ** 0.78)
+        for side in range(sides):
+            u0 = side / sides
+            u1 = (side + 1) / sides
+            a0 = u0 * math.tau
+            a1 = u1 * math.tau
+            p00 = Vec3(math.cos(a0) * r0, math.sin(a0) * r0, -t0)
+            p01 = Vec3(math.cos(a1) * r0, math.sin(a1) * r0, -t0)
+            p10 = Vec3(math.cos(a0) * r1, math.sin(a0) * r1, -t1)
+            p11 = Vec3(math.cos(a1) * r1, math.sin(a1) * r1, -t1)
+            vertices.extend((p00, p11, p01, p00, p10, p11))
+            uvs.extend((
+                Vec2(u0, t0), Vec2(u1, t1), Vec2(u1, t0),
+                Vec2(u0, t0), Vec2(u0, t1), Vec2(u1, t1),
+            ))
+    return Mesh(vertices=vertices, uvs=uvs, mode="triangle", static=True)
+
+
+_FLAME_CONE_MODEL = _make_flame_cone()
+
+
 # ----------------------------------------------------------------------
 # TEXTURE NOISE (dung cho khoi + vet lua)
 # ----------------------------------------------------------------------
@@ -225,21 +383,25 @@ def make_radial_texture(size=256, ring=False):
 
 
 def make_flame_texture(size=256):
-    """Tao sprite ngon lua thuon nhon, meo nhe thay vi mot dom tron."""
+    """Tao sprite ngon lua dai, canh gon va mui rat nhon."""
     x = np.linspace(-1.0, 1.0, size, dtype=np.float32)
     y = np.linspace(0.0, 1.0, size, dtype=np.float32)
     xx, yy = np.meshgrid(x, y)
 
     # Than rong o goc, thu nhanh ve mui; bien uon song de giong lua bi gio xe.
-    center = 0.12 * np.sin(yy * 11.0) * yy
-    width = 0.54 * (1.0 - yy) ** 0.82 + 0.004
+    center = (
+        0.085 * np.sin(yy * 12.0) * yy
+        + 0.035 * np.sin(yy * 25.0) * yy * yy
+    )
+    width = 0.49 * (1.0 - yy) ** 0.72 + 0.002
     edge = np.clip(1.0 - np.abs(xx - center) / width, 0.0, 1.0)
     vertical = np.clip(
         np.sin(np.pi * np.clip(yy, 0.0, 1.0)),
         0.0,
         1.0,
     ) ** 0.28
-    alpha = (edge ** 1.65) * vertical
+    # Luy thua cao lam bien lua sac net; loi van dac de cac sprite noi lien.
+    alpha = (edge ** 2.25) * vertical
 
     rgba = np.empty((size, size, 4), dtype=np.uint8)
     rgba[:, :, :3] = 255
@@ -599,19 +761,20 @@ class FlameTongue(Entity):
             billboard=True,
             color=tint,
             position=position,
-            rotation_z=angle + random.uniform(-15, 15),
+            rotation_z=angle + random.uniform(-36, 36),
             unlit=True,
             double_sided=True,
         )
-        enable_additive(self)
+        _retain_fire(self)
+        self.setDepthWrite(False)
         self.velocity = Vec3(*velocity)
-        self.life = random.uniform(0.68, 0.98)
+        self.life = random.uniform(0.38, 0.56)
         self.max_life = self.life
         self.age = 0.0
         self.phase = random.uniform(0, 2 * math.pi)
-        self.spin = random.uniform(-75, 75)
-        self.base_width = size * random.uniform(0.42, 0.70)
-        self.base_length = size * random.uniform(4.8, 6.8)
+        self.spin = random.uniform(-95, 95)
+        self.base_width = size * random.uniform(0.62, 0.98)
+        self.base_length = size * random.uniform(1.25, 2.20)
         self.scale = Vec3(self.base_width, self.base_length, 1)
 
         # Loi vang-trang hep lam luong lua nong va sac, khong thanh dom tron.
@@ -629,7 +792,7 @@ class FlameTongue(Entity):
 
     def _die(self):
         p = self.world_position
-        for _ in range(1):
+        if random.random() < 0.42:
             Ember(
                 p,
                 size=self.base_width * 1.4,
@@ -639,26 +802,26 @@ class FlameTongue(Entity):
                     random.uniform(0.5, 4.0),
                 ),
             )
-        if random.random() < 0.30:
+        if random.random() < 0.12:
             Smoke(p, size=self.base_width * 1.3)
-        destroy(self)
+        _finish_fire(self)
 
     def update(self):
         dt = utime.dt
         self.age += dt
         self.life -= dt
 
-        # Nhieu dong nho dao qua lai khac pha -> luong lua bi xe, du va bat on.
-        self.velocity.x += math.sin(self.age * 19.0 + self.phase) * 3.8 * dt
-        self.velocity.y += math.cos(self.age * 15.0 + self.phase) * 2.7 * dt
+        # Nhip dao nhanh nhung bien do hep: luong phun du doi ma khong bi dut.
+        self.velocity.x += math.sin(self.age * 22.0 + self.phase) * 2.8 * dt
+        self.velocity.y += math.cos(self.age * 18.0 + self.phase) * 2.2 * dt
         self.position += self.velocity * dt
         self.rotation_z += self.spin * dt
 
         progress = min(1.0, self.age / self.max_life)
         flicker = 0.82 + 0.18 * math.sin(self.age * 43.0 + self.phase)
         self.scale = Vec3(
-            self.base_width * (1.0 + progress * 1.25),
-            self.base_length * (1.0 + progress * 0.42) * flicker,
+            self.base_width * (1.0 + progress * 0.88),
+            self.base_length * (1.0 + progress * 0.52) * flicker,
             1,
         )
         fade = max(0.0, 1.0 - progress)
@@ -666,80 +829,333 @@ class FlameTongue(Entity):
         self.core.alpha = fade ** 0.9
         self.core.scale_x = 0.46 + progress * 0.18
 
-        if random.random() < 1.2 * dt:
+        if random.random() < 1.6 * dt:
             Ember(self.world_position, size=self.base_width * 0.9)
-        if random.random() < 0.55 * dt and progress > 0.35:
+        if random.random() < 0.38 * dt and progress > 0.45:
             Smoke(self.world_position, size=self.base_width)
 
         if self.z < 0.9 or self.life <= 0:
             self._die()
 
 
+class JetSpark(Entity):
+    """Tia lua dai, lao nhanh quanh loi luong phun."""
+
+    def __init__(self, position, velocity, angle):
+        super().__init__(
+            model="quad",
+            texture=glow_tex,
+            billboard=True,
+            color=random.choice([
+                color.rgba32(255, 252, 205, 255),
+                color.rgba32(255, 190, 38, 255),
+                color.rgba32(255, 78, 4, 245),
+            ]),
+            position=position,
+            rotation_z=angle + random.uniform(-8, 8),
+            scale=Vec3(
+                random.uniform(0.045, 0.105),
+                random.uniform(0.58, 1.22),
+                1,
+            ),
+            unlit=True,
+            double_sided=True,
+        )
+        _retain_fire(self)
+        enable_additive(self)
+        self.velocity = Vec3(*velocity)
+        self.life = random.uniform(0.30, 0.52)
+        self.max_life = self.life
+
+    def update(self):
+        dt = utime.dt
+        self.position += self.velocity * dt
+        self.life -= dt
+        ratio = max(0.0, self.life / self.max_life)
+        self.alpha = ratio ** 0.75
+        self.scale_y *= max(0.0, 1.0 - 1.5 * dt)
+        if self.z < 0.75 or self.life <= 0:
+            _finish_fire(self)
+
+
+class FlamePressureWave(Entity):
+    """Khoi ap suat lua lao doc luong, bung rong bat doi xung roi tan."""
+
+    def __init__(self, position, velocity, angle, size=1.0):
+        super().__init__(position=position)
+        _retain_fire(self)
+        self.velocity = Vec3(*velocity)
+        self.life = 0.46
+        self.max_life = self.life
+        self.size = size
+        self.angle = angle
+
+        self.outer_bloom = Entity(
+            parent=self,
+            model="quad",
+            texture=flame_tex,
+            billboard=True,
+            color=color.rgba32(255, 62, 3, 225),
+            rotation_z=angle,
+            unlit=True,
+            double_sided=True,
+        )
+        self.hot_bloom = Entity(
+            parent=self,
+            model="quad",
+            texture=flame_tex,
+            billboard=True,
+            color=color.rgba32(255, 225, 105, 245),
+            rotation_z=angle - 21,
+            z=-0.018,
+            unlit=True,
+            double_sided=True,
+        )
+        self.flash = Entity(
+            parent=self,
+            model="quad",
+            texture=glow_tex,
+            billboard=True,
+            color=color.rgba32(255, 132, 18, 150),
+            z=0.015,
+            unlit=True,
+            double_sided=True,
+        )
+        enable_additive(self.outer_bloom)
+        enable_additive(self.hot_bloom)
+        enable_additive(self.flash)
+
+    def update(self):
+        dt = utime.dt
+        self.position += self.velocity * dt
+        self.life -= dt
+        progress = 1.0 - max(0.0, self.life / self.max_life)
+        eased = 1.0 - (1.0 - progress) ** 3
+        self.outer_bloom.scale = Vec3(
+            self.size * (0.75 + eased * 4.4),
+            self.size * (1.4 + eased * 7.8),
+            1,
+        )
+        self.hot_bloom.scale = Vec3(
+            self.size * (0.38 + eased * 2.5),
+            self.size * (0.9 + eased * 5.5),
+            1,
+        )
+        self.flash.scale = self.size * (0.85 + eased * 4.0)
+        self.outer_bloom.rotation_z += 72 * dt
+        self.hot_bloom.rotation_z -= 105 * dt
+        self.outer_bloom.alpha = max(0.0, (1.0 - progress) ** 1.2)
+        self.hot_bloom.alpha = max(0.0, 1.0 - progress * 1.55) ** 1.45
+        self.flash.alpha = max(0.0, 1.0 - progress * 1.9)
+        if self.z < 0.70 or self.life <= 0:
+            _finish_fire(self)
+
+
+class FlameIgnitionBurst(Entity):
+    """Vu bung lua o long ban tay khi bat dau mot lan phun."""
+
+    def __init__(self, position, base_velocity, angle):
+        super().__init__(position=position)
+        _retain_fire(self)
+        self.life = 0.38
+        self.max_life = self.life
+
+        self.flash = Entity(
+            parent=self,
+            model="quad",
+            texture=glow_tex,
+            billboard=True,
+            color=color.rgba32(255, 245, 180, 245),
+            unlit=True,
+            double_sided=True,
+        )
+        self.fire_bloom = Entity(
+            parent=self,
+            model="quad",
+            texture=flame_tex,
+            billboard=True,
+            color=color.rgba32(255, 74, 3, 245),
+            rotation_z=angle,
+            z=0.018,
+            unlit=True,
+            double_sided=True,
+        )
+        enable_additive(self.flash)
+        enable_additive(self.fire_bloom)
+
+        # Tia bung uu tien huong phun, nhung van toe xung quanh diem moi lua.
+        for i in range(14):
+            radial = 2 * math.pi * i / 14 + random.uniform(-0.16, 0.16)
+            velocity = Vec3(*base_velocity) * random.uniform(0.16, 0.34)
+            velocity += Vec3(
+                math.cos(radial) * random.uniform(2.8, 7.0),
+                math.sin(radial) * random.uniform(2.8, 7.0),
+                random.uniform(-2.0, 2.5),
+            )
+            JetSpark(position, velocity, angle + math.degrees(radial))
+
+        camera.shake(duration=0.20, magnitude=0.44, speed=0.014)
+
+    def update(self):
+        self.life -= utime.dt
+        progress = 1.0 - max(0.0, self.life / self.max_life)
+        eased = 1.0 - (1.0 - progress) ** 3
+        self.flash.scale = 0.75 + eased * 4.8
+        self.fire_bloom.scale = Vec3(
+            1.3 + eased * 4.0,
+            2.8 + eased * 8.2,
+            1,
+        )
+        self.flash.alpha = max(0.0, 1.0 - progress * 1.75)
+        self.fire_bloom.alpha = max(0.0, (1.0 - progress) ** 1.2)
+        if self.life <= 0:
+            _finish_fire(self)
+
+
 class FlameStream(Entity):
     """Emitter giu than lua lien mach, khong phu thuoc FPS nhan dien tay."""
 
-    EMIT_INTERVAL = 0.022
-    REFRESH_TIMEOUT = 0.22
+    EMIT_INTERVAL = 0.020
+    SPARK_INTERVAL = 0.072
+    REFRESH_TIMEOUT = 0.26
 
     def __init__(self, hand_id):
         super().__init__()
         self.hand_id = hand_id
         self.nozzle = Vec3(0, 0, 0)
+        self.target_nozzle = Vec3(0, 0, 0)
+        self.initialized = False
         self.base_velocity = Vec3(0, 0, -19)
         self.ux = 0.0
         self.uy = 1.0
         self.angle = 0.0
         self.last_refresh = time.time()
         self.emit_timer = 0.0
+        self.spark_timer = 0.0
+        self.surge_timer = random.uniform(0.32, 0.48)
+        self.surge = 0.0
         self.timer = 0.0
 
         # Hai lop gan tay luon ton tai de noi cac particle thanh mot than lua.
         self.outer_source = Entity(
             parent=self,
             model="quad",
-            texture=flame_tex,
+            origin_y=-0.5,
             billboard=True,
-            color=color.rgba32(255, 64, 2, 255),
+            color=color.white,
+            shader=flame_jet_shader,
             unlit=True,
             double_sided=True,
         )
         self.hot_source = Entity(
             parent=self,
             model="quad",
-            texture=flame_tex,
+            origin_y=-0.5,
             billboard=True,
-            color=color.rgba32(255, 238, 125, 255),
+            color=color.white,
+            shader=flame_jet_shader,
             z=-0.012,
             unlit=True,
             double_sided=True,
         )
-        enable_additive(self.outer_source)
+        self.outer_source.set_shader_input("phase", random.uniform(0, 10))
+        self.outer_source.set_shader_input("heat", 0.66)
+        self.outer_source.set_shader_input("turbulence", 0.48)
+        self.hot_source.set_shader_input("phase", random.uniform(0, 10))
+        self.hot_source.set_shader_input("heat", 1.0)
+        self.hot_source.set_shader_input("turbulence", 0.30)
+        self.outer_source.setDepthWrite(False)
         enable_additive(self.hot_source)
 
-        # Cac lop cau noi nam sau dan theo truc z. Chung lap hinh len nhau,
-        # noi nguon o long ban tay voi particle dang lao ra phia camera.
+        self.source_glow = Entity(
+            parent=self,
+            model="quad",
+            texture=glow_tex,
+            billboard=True,
+            color=color.rgba32(255, 188, 35, 235),
+            z=0.02,
+            unlit=True,
+            double_sided=True,
+        )
+        enable_additive(self.source_glow)
+
+        # Ong lua hinh non gom nhieu tiet dien chong lap. Moi tiet dien co vo
+        # do-cam va loi vang-trang rieng, tao mot khoi phun lien tuc thay vi
+        # cac sprite roi rac.
         self.bridges = []
         bridge_specs = [
-            (1.5, 0.82, 4.5, color.rgba32(255, 225, 90, 250)),
-            (3.2, 1.02, 5.0, color.rgba32(255, 150, 18, 255)),
-            (5.2, 1.28, 5.6, color.rgba32(255, 82, 3, 250)),
-            (7.4, 1.58, 6.2, color.rgba32(238, 38, 1, 235)),
+            (0.70, 0.58, 4.2, color.white),
+            (2.60, 0.78, 4.7, color.white),
+            (4.55, 1.02, 5.2, color.white),
+            (6.50, 1.28, 5.7, color.white),
+            (8.45, 1.56, 6.2, color.white),
+            (10.40, 1.86, 6.7, color.white),
         ]
-        for depth, width, length, tint in bridge_specs:
-            bridge = Entity(
+        for depth, width, length, _tint in bridge_specs:
+            progress = depth / bridge_specs[-1][0]
+            outer = Entity(
                 parent=self,
                 model="quad",
-                texture=flame_tex,
                 billboard=True,
-                color=tint,
+                color=color.white,
+                shader=flame_jet_shader,
                 unlit=True,
                 double_sided=True,
             )
-            enable_additive(bridge)
-            self.bridges.append((bridge, depth, width, length))
+            core = Entity(
+                parent=self,
+                model="quad",
+                billboard=True,
+                color=color.white,
+                shader=flame_jet_shader,
+                unlit=True,
+                double_sided=True,
+            )
+            outer.set_shader_input("phase", random.uniform(0, 20))
+            outer.set_shader_input("heat", 0.58 - progress * 0.36)
+            outer.set_shader_input("turbulence", 0.52 + progress * 0.46)
+            core.set_shader_input("phase", random.uniform(0, 20))
+            core.set_shader_input("heat", 1.0 - progress * 0.42)
+            core.set_shader_input("turbulence", 0.30 + progress * 0.28)
+            outer.setDepthWrite(False)
+            enable_additive(core)
+            self.bridges.append((outer, core, depth, width, length))
+
+        # Mot mesh non lien tuc tao the tich 3D that tu tay toi dau luong.
+        # Lop vo alpha-blend giu mau cam/do; loi nho hon additive de phat nong.
+        self.volume_shell = Entity(
+            parent=self,
+            model=copy(_FLAME_CONE_MODEL),
+            color=color.white,
+            shader=flame_jet_shader,
+            unlit=True,
+            double_sided=False,
+        )
+        self.volume_shell.set_shader_input("heat", 0.48)
+        self.volume_shell.set_shader_input("turbulence", 0.72)
+        self.volume_shell.set_shader_input("phase", random.uniform(0, 20))
+        self.volume_shell.setDepthWrite(True)
+
+        self.volume_core = Entity(
+            parent=self,
+            model=copy(_FLAME_CONE_MODEL),
+            color=color.white,
+            shader=flame_jet_shader,
+            unlit=True,
+            double_sided=False,
+        )
+        self.volume_core.set_shader_input("heat", 0.94)
+        self.volume_core.set_shader_input("turbulence", 0.38)
+        self.volume_core.set_shader_input("phase", random.uniform(0, 20))
+        enable_additive(self.volume_core)
+        self.volume_core.setDepthWrite(True)
 
     def refresh(self, nozzle, velocity, ux, uy, angle):
-        self.nozzle = Vec3(*nozzle)
+        self.target_nozzle = Vec3(*nozzle)
+        if not self.initialized:
+            self.nozzle = Vec3(*nozzle)
+            self.initialized = True
+            FlameIgnitionBurst(self.nozzle, velocity, angle)
         self.base_velocity = Vec3(*velocity)
         self.ux = ux
         self.uy = uy
@@ -748,23 +1164,23 @@ class FlameStream(Entity):
         self.position = self.nozzle
 
     def _emit(self):
-        # Ba dong lap day; dong giua la loi nong, hai dong ngoai xe mui lua.
-        for i in range(3):
-            spread = 0.42 if i == 0 else 0.9
+        # Ba dong lap day: mot loi trang nong va hai lop cam-do bung rong.
+        # Tong mat do cao hon nhung van bi khoa theo thoi gian, khong phu thuoc FPS.
+        for i, spread in enumerate((0.30, 0.72, 1.18)):
             velocity = self.base_velocity + Vec3(
-                random.uniform(-2.1, 2.1) * spread,
-                random.uniform(-1.8, 2.5) * spread,
-                random.uniform(-1.6, 1.0),
+                random.uniform(-2.5, 2.5) * spread,
+                random.uniform(-2.2, 3.0) * spread,
+                random.uniform(-1.2, 0.7),
             )
             spawn = self.nozzle + Vec3(
-                random.uniform(-0.16, 0.16),
-                random.uniform(-0.14, 0.14),
+                random.uniform(-0.11, 0.11),
                 random.uniform(-0.10, 0.10),
+                random.uniform(-0.07, 0.07),
             )
             FlameTongue(
                 spawn,
                 velocity,
-                size=random.uniform(0.86, 1.18),
+                size=random.uniform(1.24, 1.78),
                 angle=self.angle,
                 hot=(i == 0),
             )
@@ -776,34 +1192,192 @@ class FlameStream(Entity):
         if idle > self.REFRESH_TIMEOUT:
             if _streams.get(self.hand_id) is self:
                 _streams.pop(self.hand_id, None)
-            destroy(self)
+            _finish_fire(self)
             return
 
+        # Loc rung tracking nhe de goc phun bam tay nhung khong giat tung frame.
+        follow = 1.0 - math.exp(-22.0 * dt)
+        self.nozzle += (self.target_nozzle - self.nozzle) * follow
         self.position = self.nozzle
-        flicker = 0.90 + 0.10 * math.sin(self.timer * 47.0)
-        self.outer_source.rotation_z = self.angle + math.sin(self.timer * 21) * 5
-        self.hot_source.rotation_z = self.angle - math.sin(self.timer * 27) * 3
-        self.outer_source.scale = Vec3(1.15 * flicker, 5.8, 1)
-        self.hot_source.scale = Vec3(0.58 * flicker, 4.5, 1)
+
+        self.surge = max(0.0, self.surge - dt * 3.25)
+        self.surge_timer -= dt
+        if self.surge_timer <= 0.0:
+            self.surge = random.uniform(0.82, 1.0)
+            self.surge_timer = random.uniform(0.36, 0.58)
+            wave_velocity = self.base_velocity * random.uniform(0.42, 0.58)
+            FlamePressureWave(
+                self.nozzle,
+                wave_velocity,
+                self.angle,
+                size=random.uniform(1.02, 1.34),
+            )
+            # Mot xung nhien lieu day them nhieu luoi lua vao cung mot frame.
+            self._emit()
+            self._emit()
+            self._emit()
+            self._emit()
+            camera.shake(
+                duration=0.11,
+                magnitude=0.22 + self.surge * 0.14,
+                speed=0.012,
+            )
+
+        flicker = (
+            0.92
+            + 0.055 * math.sin(self.timer * 43.0)
+            + 0.025 * math.sin(self.timer * 71.0)
+            + self.surge * 0.22
+        )
+        # Chan hai lop nam dung tai long ban tay. Hai lop dao lech pha de phan
+        # dau lua cong, vặn va khong con thanh mot tia thang cung.
+        source_sway = (
+            math.sin(self.timer * 7.2) * 8.5
+            + math.sin(self.timer * 13.7 + 1.4) * 3.5
+        )
+        self.outer_source.rotation_z = self.angle + source_sway
+        self.hot_source.rotation_z = (
+            self.angle + source_sway * 0.58 - math.sin(self.timer * 17.0) * 3.8
+        )
+        self.outer_source.set_shader_input("time", self.timer)
+        self.hot_source.set_shader_input("time", self.timer * 1.08 + 2.7)
+        # Rut ngan loi gan tay: bridge cong va the tich 3D se tao chieu dai,
+        # tranh vet vang thang nhu laser chay xuyen ca luong.
+        self.outer_source.scale = Vec3(2.42 * flicker, 6.8, 1)
+        self.hot_source.scale = Vec3(1.12 * flicker, 5.2, 1)
+        self.outer_source.alpha = 0.62
+        self.hot_source.alpha = 0.49
+        self.source_glow.scale = 3.9 * flicker
+        self.source_glow.alpha = 0.68 + 0.16 * flicker
         self.outer_source.position = Vec3(0, 0, 0)
         self.hot_source.position = Vec3(0, 0, -0.02)
 
-        for i, (bridge, depth, width, length) in enumerate(self.bridges):
-            wave = math.sin(self.timer * (19 + i * 3) + i) * 0.12
-            pulse = 0.90 + 0.10 * math.sin(self.timer * (37 + i * 2) + i)
-            bridge.position = Vec3(
-                self.ux * depth * 0.24 + wave,
-                self.uy * depth * 0.24 - wave * 0.5,
+        bridge_count = max(1, len(self.bridges) - 1)
+        for i, (outer, core, depth, width, length) in enumerate(self.bridges):
+            progress = i / bridge_count
+            # Song nhiet chay tu gan tay ra dau luong, cho cam giac khi bi ep.
+            phase = self.timer * 18.0 - depth * 1.42
+            # Duong tam uon mem: bien do tang dan ve dau luong, gom song lon
+            # cham va song nho nhanh de lua cong vẹo tu nhien thay vi thang cung.
+            macro_bend = (
+                math.sin(self.timer * 4.1 - progress * 3.6)
+                * (0.04 + progress * 0.62)
+            )
+            tip_whip = (
+                math.sin(self.timer * 2.35 + progress * 5.2 + 1.1)
+                * (progress ** 1.7) * 0.46
+            )
+            cross_wave = (
+                macro_bend
+                + tip_whip
+                + math.sin(phase) * (0.035 + progress * 0.13)
+            )
+            lift_wave = (
+                math.cos(self.timer * 3.25 - progress * 2.8)
+                * (0.025 + progress * 0.24)
+                + math.cos(phase * 0.83) * (0.018 + progress * 0.075)
+            )
+            pulse = (
+                0.94
+                + 0.085 * math.sin(self.timer * 32.0 - depth * 2.05)
+                + 0.025 * math.sin(self.timer * 57.0 + i)
+            )
+            position = Vec3(
+                self.ux * depth * 0.205 - self.uy * cross_wave,
+                self.uy * depth * 0.205 + self.ux * cross_wave + lift_wave,
                 -depth,
             )
-            bridge.rotation_z = self.angle + math.sin(self.timer * 23 + i) * 7
-            bridge.scale = Vec3(width * pulse, length * pulse, 1)
-            bridge.alpha = 0.82 + 0.18 * pulse
+            rotation = (
+                self.angle
+                + math.sin(self.timer * 4.1 - progress * 3.6)
+                * (4.0 + progress * 13.0)
+                + math.sin(self.timer * 12.5 - depth * 0.58)
+                * (1.5 + progress * 4.5)
+            )
+            outer.position = position
+            outer.rotation_z = rotation
+            outer.scale = Vec3(width * 1.68 * pulse, length * 1.38 * pulse, 1)
+            outer.alpha = (0.25 - progress * 0.065) * pulse
+            outer.set_shader_input("time", self.timer + depth * 0.045)
+
+            core.position = Vec3(position.x, position.y, position.z - 0.025)
+            core.rotation_z = rotation - math.sin(phase * 1.35) * 2.0
+            core.scale = Vec3(
+                width * (0.68 - progress * 0.15) * pulse,
+                length * (1.25 - progress * 0.12) * pulse,
+                1,
+            )
+            core.alpha = max(0.025, 0.12 - progress * 0.075) * pulse
+            core.set_shader_input("time", self.timer * 1.06 + depth * 0.065)
+
+        cone_depth = 12.6
+        pressure = (
+            0.94
+            + 0.055 * math.sin(self.timer * 25.0)
+            + 0.025 * math.sin(self.timer * 43.0)
+            + self.surge * 0.30
+        )
+        target_x = self.ux * cone_depth * 0.205
+        target_y = self.uy * cone_depth * 0.205
+        pitch = math.degrees(math.atan2(target_y, cone_depth))
+        yaw = -math.degrees(math.atan2(target_x, cone_depth))
+
+        self.volume_shell.position = Vec3(0, 0, -0.08)
+        volume_sway = math.sin(self.timer * 4.1) * 2.8
+        self.volume_shell.rotation = Vec3(
+            pitch + math.sin(self.timer * 5.4) * 2.2,
+            yaw + math.cos(self.timer * 4.7) * 2.2,
+            self.timer * 9.0 + volume_sway,
+        )
+        self.volume_shell.scale = Vec3(
+            3.58 * pressure,
+            3.58 * pressure,
+            cone_depth * 1.08 * (0.98 + 0.02 * pressure),
+        )
+        self.volume_shell.alpha = (0.39 + self.surge * 0.13) * pressure
+        self.volume_shell.set_shader_input("time", self.timer * 1.55)
+
+        self.volume_core.position = Vec3(0, 0, -0.10)
+        self.volume_core.rotation = Vec3(
+            pitch - math.sin(self.timer * 5.4) * 1.4,
+            yaw - math.cos(self.timer * 4.7) * 1.4,
+            -self.timer * 12.0 + volume_sway * 0.55,
+        )
+        self.volume_core.scale = Vec3(
+            1.82 * pressure,
+            1.82 * pressure,
+            cone_depth * 1.01,
+        )
+        self.volume_core.alpha = (0.15 + self.surge * 0.085) * pressure
+        self.volume_core.set_shader_input("time", self.timer * 1.85 + 2.4)
 
         self.emit_timer -= dt
         while self.emit_timer <= 0:
             self._emit()
             self.emit_timer += self.EMIT_INTERVAL
+
+        self.spark_timer -= dt
+        while self.spark_timer <= 0:
+            # Moi nhip ban ba tia: mot tia bam loi va hai tia xe rong hai ben.
+            # Cac vet dai, nhanh va lech goc nhe lam luong lua du doi hon.
+            for spark_index in range(3):
+                spread = 0.48 if spark_index == 0 else 1.0
+                spark_velocity = self.base_velocity * random.uniform(1.20, 1.62)
+                spark_velocity += Vec3(
+                    random.uniform(-5.4, 5.4) * spread,
+                    random.uniform(-4.2, 5.8) * spread,
+                    random.uniform(-2.0, 1.2),
+                )
+                JetSpark(
+                    self.nozzle + Vec3(
+                        random.uniform(-0.26, 0.26),
+                        random.uniform(-0.22, 0.22),
+                        random.uniform(-0.10, 0.10),
+                    ),
+                    spark_velocity,
+                    self.angle + random.uniform(-7.0, 7.0),
+                )
+            self.spark_timer += self.SPARK_INTERVAL
 
 
 FIRE_SOUND_COOLDOWN = 0.55
@@ -819,20 +1393,22 @@ def cast(lm, hand_to_world, hand_id=""):
     - hand_id      : khoa phan biet tay (vd "Left"/"Right") de cooldown doc lap
     """
     now = time.time()
-    # Tam long ban tay = trung diem giua co tay va tam hang bon khop goc.
-    # Cach nay dat nguon thap hon centroid cu, dung vao phan rong cua long tay.
+    # Tam long ban tay nam giua co tay va hang bon khop MCP. Dat trong so hoi
+    # ve co tay de nguon khong bi troi len sat cac ngon khi ban tay xoe rong.
     mcp_ids = (5, 9, 13, 17)
     mcp_x = sum(lm[i].x for i in mcp_ids) / len(mcp_ids)
     mcp_y = sum(lm[i].y for i in mcp_ids) / len(mcp_ids)
-    palm_x = (lm[0].x + mcp_x) * 0.5
-    palm_y = (lm[0].y + mcp_y) * 0.5
+    palm_x = lm[0].x * 0.52 + mcp_x * 0.48
+    palm_y = lm[0].y * 0.52 + mcp_y * 0.48
     pos = hand_to_world(palm_x, palm_y)
     dx = lm[12].x - lm[0].x
     dy = lm[0].y - lm[12].y
     n = math.hypot(dx, dy) or 1
     ux, uy = dx / n, dy / n
+    # Nguon trung dung long ban tay; cac quad duoc neo o chan (origin_y=-0.5)
+    # nen lua chi phun ra ngoai, khong chay nguoc xuyen qua canh tay.
     nozzle = pos
-    base_velocity = Vec3(ux * 5.0, uy * 5.0, -17.0)
+    base_velocity = Vec3(ux * 9.8, uy * 9.8, -28.0)
     screen_angle = -math.degrees(math.atan2(ux, uy))
 
     stream = _streams.get(hand_id)
